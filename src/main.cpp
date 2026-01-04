@@ -3,18 +3,9 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "secrets.h"
 
 // ==================== CONFIGURATION ====================
-// WiFi credentials
-const char* WIFI_SSID = "Plumdog";
-const char* WIFI_PASSWORD = "Zemeckis";
-
-// MQTT broker settings
-const char* MQTT_SERVER = "YOUR_MQTT_BROKER_IP";
-const int MQTT_PORT = 1883;
-const char* MQTT_USER = "";      // Leave empty if no auth
-const char* MQTT_PASSWORD = "";  // Leave empty if no auth
-
 // Device settings
 const char* DEVICE_NAME = "ina228_power_monitor";
 const char* DEVICE_FRIENDLY_NAME = "INA228 Power Monitor";
@@ -24,8 +15,17 @@ const uint8_t INA228_ADDR = 0x40;  // Default I2C address (A0=GND, A1=GND)
 const float SHUNT_RESISTOR = 0.015; // 15mΩ shunt resistor (adjust for your setup)
 const float MAX_CURRENT = 10.0;     // Maximum expected current in Amps
 
-// Update interval (ms)
-const unsigned long UPDATE_INTERVAL = 5000;
+// Sleep intervals (seconds) - varies based on battery voltage
+const uint64_t SLEEP_INTERVAL_FAST = 5;     // < 3.3V (low battery alert)
+const uint64_t SLEEP_INTERVAL_NORMAL = 30;  // 3.3V - 4.0V
+const uint64_t SLEEP_INTERVAL_SLOW = 60;    // > 4.0V (full battery, save power)
+
+// Voltage thresholds for interval adjustment
+const float VOLTAGE_LOW = 3.3;
+const float VOLTAGE_HIGH = 4.0;
+
+// Publish HA discovery every N boots (saves time/power)
+const int DISCOVERY_INTERVAL = 20;
 
 // ==================== INA228 REGISTERS ====================
 #define INA228_REG_CONFIG      0x00
@@ -39,11 +39,12 @@ const unsigned long UPDATE_INTERVAL = 5000;
 #define INA228_REG_MANUFACTURER_ID 0x3E
 #define INA228_REG_DEVICE_ID   0x3F
 
+// ==================== RTC MEMORY (survives deep sleep) ====================
+RTC_DATA_ATTR int bootCount = 0;
+
 // ==================== GLOBALS ====================
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
-unsigned long lastUpdate = 0;
-bool haDiscoveryPublished = false;
 float currentLSB;
 
 // ==================== INA228 FUNCTIONS ====================
@@ -77,12 +78,9 @@ uint32_t readRegister24(uint8_t reg) {
 }
 
 bool initINA228() {
-    // Check manufacturer ID (should be 0x5449 = "TI")
     uint16_t mfgId = readRegister16(INA228_REG_MANUFACTURER_ID);
-    Serial.printf("Manufacturer ID: 0x%04X\n", mfgId);
-
     if (mfgId != 0x5449) {
-        Serial.println("INA228 not found!");
+        Serial.printf("INA228 not found! (ID: 0x%04X)\n", mfgId);
         return false;
     }
 
@@ -91,57 +89,35 @@ bool initINA228() {
     delay(10);
 
     // Configure ADC: continuous mode, all measurements
-    // Bits 15-12: Mode = 1111 (continuous bus, shunt, temp)
-    // Bits 11-9: VBUSCT = 101 (1052µs)
-    // Bits 8-6: VSHCT = 101 (1052µs)
-    // Bits 5-3: VTCT = 101 (1052µs)
-    // Bits 2-0: AVG = 011 (16 averages)
+    // Mode=1111, VBUSCT=101 (1052µs), VSHCT=101, VTCT=101, AVG=011 (16 avg)
     writeRegister16(INA228_REG_ADC_CONFIG, 0xFB6B);
 
     // Calculate and set calibration
-    // SHUNT_CAL = 13107.2 × 10^6 × CURRENT_LSB × Rshunt
-    // CURRENT_LSB = Max Expected Current / 2^19
     currentLSB = MAX_CURRENT / 524288.0;  // 2^19
     uint16_t shuntCal = (uint16_t)(13107.2e6 * currentLSB * SHUNT_RESISTOR);
     writeRegister16(INA228_REG_SHUNT_CAL, shuntCal);
-
-    Serial.printf("Current LSB: %.9f A\n", currentLSB);
-    Serial.printf("Shunt Cal: %u\n", shuntCal);
 
     return true;
 }
 
 float readBusVoltage() {
     uint32_t raw = readRegister24(INA228_REG_VBUS);
-    // VBUS LSB = 195.3125µV, shift right 4 bits (20-bit value in 24-bit register)
     return (raw >> 4) * 195.3125e-6;
-}
-
-float readShuntVoltage() {
-    int32_t raw = readRegister24(INA228_REG_VSHUNT);
-    // Sign extend from 24-bit to 32-bit
-    if (raw & 0x800000) raw |= 0xFF000000;
-    // VSHUNT LSB = 312.5nV, shift right 4 bits
-    return (raw >> 4) * 312.5e-9;
 }
 
 float readCurrent() {
     int32_t raw = readRegister24(INA228_REG_CURRENT);
-    // Sign extend from 24-bit to 32-bit
     if (raw & 0x800000) raw |= 0xFF000000;
-    // Shift right 4 bits (20-bit value)
     return (raw >> 4) * currentLSB;
 }
 
 float readPower() {
     uint32_t raw = readRegister24(INA228_REG_POWER);
-    // Power LSB = 3.2 × Current_LSB
     return raw * 3.2 * currentLSB;
 }
 
 float readTemperature() {
     uint16_t raw = readRegister16(INA228_REG_DIETEMP);
-    // Temp LSB = 7.8125m°C
     return (raw >> 4) * 7.8125e-3;
 }
 
@@ -149,7 +125,6 @@ float readTemperature() {
 void publishHADiscovery() {
     String baseTopic = "homeassistant/sensor/" + String(DEVICE_NAME);
 
-    // Device info JSON (shared across all entities)
     JsonDocument deviceDoc;
     deviceDoc["identifiers"][0] = DEVICE_NAME;
     deviceDoc["name"] = DEVICE_FRIENDLY_NAME;
@@ -187,104 +162,129 @@ void publishHADiscovery() {
         serializeJson(doc, payload);
 
         mqtt.publish(configTopic.c_str(), payload.c_str(), true);
-        Serial.printf("Published discovery: %s\n", sensor.id);
     }
-
-    haDiscoveryPublished = true;
+    Serial.println("Published HA discovery");
 }
 
-void reconnectMQTT() {
-    while (!mqtt.connected()) {
-        Serial.print("Connecting to MQTT...");
+bool connectMQTT() {
+    String clientId = String(DEVICE_NAME) + "_" + String(random(0xffff), HEX);
 
-        String clientId = String(DEVICE_NAME) + "_" + String(random(0xffff), HEX);
-        bool connected;
-
-        if (strlen(MQTT_USER) > 0) {
-            connected = mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
-        } else {
-            connected = mqtt.connect(clientId.c_str());
-        }
-
-        if (connected) {
-            Serial.println("connected!");
-            haDiscoveryPublished = false; // Re-publish discovery on reconnect
-        } else {
-            Serial.printf("failed, rc=%d, retrying in 5s\n", mqtt.state());
-            delay(5000);
-        }
+    if (strlen(MQTT_USER) > 0) {
+        return mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
     }
+    return mqtt.connect(clientId.c_str());
 }
 
 void publishReadings(float voltage, float current, float power, float temperature) {
     JsonDocument doc;
-    doc["voltage"] = round(voltage * 1000) / 1000.0;  // 3 decimal places
+    doc["voltage"] = round(voltage * 1000) / 1000.0;
     doc["current"] = round(current * 1000) / 1000.0;
     doc["power"] = round(power * 1000) / 1000.0;
-    doc["temperature"] = round(temperature * 10) / 10.0;  // 1 decimal place
+    doc["temperature"] = round(temperature * 10) / 10.0;
 
     String payload;
     serializeJson(doc, payload);
 
-    String topic = String(DEVICE_NAME) + "/state";
-    mqtt.publish(topic.c_str(), payload.c_str());
-
+    mqtt.publish((String(DEVICE_NAME) + "/state").c_str(), payload.c_str());
     Serial.printf("Published: V=%.3f, I=%.3f, P=%.3f, T=%.1f\n",
                   voltage, current, power, temperature);
 }
 
-// ==================== SETUP & LOOP ====================
+// ==================== DEEP SLEEP ====================
+void goToSleep(uint64_t seconds) {
+    Serial.printf("Sleeping for %llu seconds...\n", seconds);
+    Serial.flush();
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+uint64_t getSleepInterval(float voltage) {
+    if (voltage < VOLTAGE_LOW) {
+        return SLEEP_INTERVAL_FAST;  // Low battery - report frequently
+    } else if (voltage > VOLTAGE_HIGH) {
+        return SLEEP_INTERVAL_SLOW;  // Full battery - conserve power
+    }
+    return SLEEP_INTERVAL_NORMAL;
+}
+
+// ==================== SETUP (runs every wake) ====================
 void setup() {
     Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n\nINA228 Power Monitor Starting...");
+    delay(100);
+
+    bootCount++;
+    Serial.printf("\n\nBoot #%d\n", bootCount);
 
     // Initialize I2C (FireBeetle ESP32-E default pins: SDA=21, SCL=22)
     Wire.begin(21, 22);
-    Wire.setClock(400000);  // 400kHz I2C
+    Wire.setClock(400000);
 
     // Initialize INA228
     if (!initINA228()) {
-        Serial.println("Failed to initialize INA228! Check wiring.");
-        while (1) delay(1000);
+        Serial.println("INA228 init failed! Sleeping 60s...");
+        goToSleep(60);
     }
-    Serial.println("INA228 initialized successfully");
+
+    // Wait for ADC conversion (with averaging)
+    delay(100);
+
+    // Read sensor values
+    float voltage = readBusVoltage();
+    float current = readCurrent();
+    float power = readPower();
+    float temperature = readTemperature();
+
+    Serial.printf("Read: V=%.3f, I=%.3f, P=%.3f, T=%.1f\n",
+                  voltage, current, power, temperature);
 
     // Connect to WiFi
-    Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
+
+    int wifiAttempts = 0;
+    while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) {
         delay(500);
-        Serial.print(".");
+        wifiAttempts++;
     }
-    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-    // Setup MQTT
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi failed! Sleeping...");
+        goToSleep(getSleepInterval(voltage));
+    }
+    Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+    // Connect to MQTT
     mqtt.setServer(MQTT_SERVER, MQTT_PORT);
-    mqtt.setBufferSize(1024);  // Larger buffer for HA discovery messages
-}
+    mqtt.setBufferSize(1024);
 
-void loop() {
-    // Ensure MQTT connection
-    if (!mqtt.connected()) {
-        reconnectMQTT();
+    if (!connectMQTT()) {
+        Serial.println("MQTT failed! Sleeping...");
+        goToSleep(getSleepInterval(voltage));
     }
-    mqtt.loop();
+    Serial.println("MQTT connected");
 
-    // Publish Home Assistant discovery (once after connect)
-    if (!haDiscoveryPublished) {
+    // Publish HA discovery periodically (not every boot)
+    if (bootCount == 1 || bootCount % DISCOVERY_INTERVAL == 0) {
         publishHADiscovery();
     }
 
-    // Read and publish at interval
-    if (millis() - lastUpdate >= UPDATE_INTERVAL) {
-        lastUpdate = millis();
+    // Publish readings
+    publishReadings(voltage, current, power, temperature);
 
-        float voltage = readBusVoltage();
-        float current = readCurrent();
-        float power = readPower();
-        float temperature = readTemperature();
+    // Give MQTT time to send
+    mqtt.loop();
+    delay(100);
+    mqtt.loop();
 
-        publishReadings(voltage, current, power, temperature);
-    }
+    // Calculate sleep time based on voltage
+    uint64_t sleepTime = getSleepInterval(voltage);
+    goToSleep(sleepTime);
+}
+
+void loop() {
+    // Never reached - device sleeps after setup()
 }
