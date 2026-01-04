@@ -29,6 +29,9 @@ const float VOLTAGE_HIGH = 3.8; // More conservative threshold
 // Publish HA discovery every N boots (saves time/power)
 const int DISCOVERY_INTERVAL = 20;
 
+// GPIO to power the INA228 (allows complete power-off during sleep)
+const int INA228_POWER_PIN = 13;
+
 // ==================== INA228 REGISTERS ====================
 #define INA228_REG_CONFIG 0x00
 #define INA228_REG_ADC_CONFIG 0x01
@@ -224,8 +227,9 @@ void publishReadings(float voltage, float current, float power,
 void goToSleep(uint64_t seconds) {
   Serial.printf("Sleeping for %llu seconds...\n", seconds);
 
-  // Put INA228 into shutdown mode to save power
-  sleepINA228();
+  // Power off the INA228 completely via GPIO (saves ~5mA including LED)
+  digitalWrite(INA228_POWER_PIN, LOW);
+  Serial.println("INA228 powered off");
 
   Serial.flush();
 
@@ -252,6 +256,11 @@ void setup() {
 
   bootCount++;
   Serial.printf("\n\nBoot #%d\n", bootCount);
+
+  // Power on the INA228 via GPIO
+  pinMode(INA228_POWER_PIN, OUTPUT);
+  digitalWrite(INA228_POWER_PIN, HIGH);
+  delay(10); // Let power stabilize
 
   // Initialize I2C (FireBeetle ESP32-E default pins: SDA=21, SCL=22)
   Wire.begin(21, 22);
