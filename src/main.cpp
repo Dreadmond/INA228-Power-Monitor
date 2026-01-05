@@ -16,15 +16,17 @@ const float SHUNT_RESISTOR = 0.015; // 15mΩ shunt resistor (Adafruit INA228)
 const float MAX_CURRENT =
     0.1; // Maximum expected current in Amps (100mA for solar panel)
 
-// Sleep intervals (seconds) - varies based on battery voltage
-const uint64_t SLEEP_INTERVAL_FAST =
-    30; // < 3.3V (low battery - minimal updates)
-const uint64_t SLEEP_INTERVAL_NORMAL = 120; // 3.3V - 3.8V (2 minutes)
-const uint64_t SLEEP_INTERVAL_SLOW = 300;   // > 3.8V (5 minutes - save power)
+// Sleep intervals (seconds) - titrated based on battery voltage
+// Indoor solar produces only ~200µW peak (~50µA at 3.7V)
+// One wake cycle uses ~0.15mAh, needs ~3 hours of peak sun to recover!
+// Lower voltage = longer sleep to conserve power and protect battery
+const uint64_t SLEEP_MIN = 900;     // Minimum sleep at full charge (15 minutes)
+const uint64_t SLEEP_MAX = 14400;   // Maximum sleep when battery critical (4 hours)
 
-// Voltage thresholds for interval adjustment
-const float VOLTAGE_LOW = 3.3;
-const float VOLTAGE_HIGH = 3.8; // More conservative threshold
+// Voltage thresholds for titration
+const float VOLTAGE_CRITICAL = 3.4; // Below this: maximum sleep (emergency mode)
+const float VOLTAGE_LOW = 3.6;      // Below this: long sleep
+const float VOLTAGE_FULL = 3.9;     // Above this: minimum sleep
 
 // Publish HA discovery every N boots (saves time/power)
 const int DISCOVERY_INTERVAL = 20;
@@ -241,12 +243,30 @@ void goToSleep(uint64_t seconds) {
 }
 
 uint64_t getSleepInterval(float voltage) {
-  if (voltage < VOLTAGE_LOW) {
-    return SLEEP_INTERVAL_FAST; // Low battery - report frequently
-  } else if (voltage > VOLTAGE_HIGH) {
-    return SLEEP_INTERVAL_SLOW; // Full battery - conserve power
+  // Titrate sleep duration based on battery voltage
+  // Lower voltage = longer sleep to protect battery from going below 3.3V
+  
+  if (voltage <= VOLTAGE_CRITICAL) {
+    // Emergency mode - sleep as long as possible
+    Serial.println("CRITICAL: Battery at minimum! Maximum sleep.");
+    return SLEEP_MAX;
   }
-  return SLEEP_INTERVAL_NORMAL;
+  
+  if (voltage >= VOLTAGE_FULL) {
+    // Full battery - can afford frequent updates
+    return SLEEP_MIN;
+  }
+  
+  // Linear interpolation between VOLTAGE_CRITICAL and VOLTAGE_FULL
+  // As voltage decreases, sleep time increases
+  float range = VOLTAGE_FULL - VOLTAGE_CRITICAL;
+  float normalized = (voltage - VOLTAGE_CRITICAL) / range; // 0.0 to 1.0
+  
+  // Invert: low voltage = high sleep, high voltage = low sleep
+  uint64_t sleepTime = SLEEP_MAX - (uint64_t)(normalized * (SLEEP_MAX - SLEEP_MIN));
+  
+  Serial.printf("Titrated sleep: %.2fV -> %llu seconds\n", voltage, sleepTime);
+  return sleepTime;
 }
 
 // ==================== SETUP (runs every wake) ====================
